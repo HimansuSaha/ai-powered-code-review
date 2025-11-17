@@ -1,0 +1,317 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Backend Testing
+  backend-test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_ai_code_review
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        cd backend
+        pip install -r requirements.txt
+        pip install pytest-cov pytest-asyncio
+    
+    - name: Run tests
+      env:
+        DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/test_ai_code_review
+        REDIS_URL: redis://localhost:6379/0
+        SECRET_KEY: test-secret-key-for-ci-pipeline-only
+      run: |
+        cd backend
+        pytest --cov=app --cov-report=xml --cov-report=html -v
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./backend/coverage.xml
+        flags: backend
+        name: backend-coverage
+    
+    - name: Lint with flake8
+      run: |
+        cd backend
+        flake8 app --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 app --count --exit-zero --max-complexity=10 --max-line-length=88 --statistics
+    
+    - name: Type check with mypy
+      run: |
+        cd backend
+        mypy app --ignore-missing-imports
+
+  # Frontend Testing
+  frontend-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+    
+    - name: Install dependencies
+      run: |
+        cd frontend
+        npm ci
+    
+    - name: Run tests
+      run: |
+        cd frontend
+        npm test -- --coverage --watchAll=false
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./frontend/coverage/lcov.info
+        flags: frontend
+        name: frontend-coverage
+    
+    - name: Lint
+      run: |
+        cd frontend
+        npm run lint
+    
+    - name: Type check
+      run: |
+        cd frontend
+        npm run type-check || true  # Non-blocking for now
+    
+    - name: Build
+      run: |
+        cd frontend
+        npm run build
+
+  # Security Scanning
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: [backend-test, frontend-test]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: 'trivy-results.sarif'
+    
+    - name: Python dependency security scan
+      run: |
+        cd backend
+        pip install safety bandit
+        safety check
+        bandit -r app -f json -o bandit-report.json || true
+    
+    - name: Node.js dependency security scan
+      run: |
+        cd frontend
+        npm audit --audit-level=high
+
+  # Docker Build and Push
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: [backend-test, frontend-test, security-scan]
+    if: github.ref == 'refs/heads/main'
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata (tags, labels) for backend
+      id: meta-backend
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push backend image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend
+        push: true
+        tags: ${{ steps.meta-backend.outputs.tags }}
+        labels: ${{ steps.meta-backend.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    - name: Extract metadata (tags, labels) for frontend
+      id: meta-frontend
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-frontend
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push frontend image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./frontend
+        push: true
+        tags: ${{ steps.meta-frontend.outputs.tags }}
+        labels: ${{ steps.meta-frontend.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # Integration Tests
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Create test environment file
+      run: |
+        cat > .env << EOF
+        DATABASE_PASSWORD=postgres123
+        REDIS_PASSWORD=redis123
+        SECRET_KEY=test-secret-key-for-integration-tests
+        GRAFANA_PASSWORD=admin123
+        DEBUG=false
+        EOF
+    
+    - name: Start services
+      run: |
+        docker-compose up -d
+        sleep 30  # Wait for services to be ready
+    
+    - name: Wait for backend to be healthy
+      run: |
+        timeout 60 bash -c 'until curl -f http://localhost:8000/health; do sleep 2; done'
+    
+    - name: Run integration tests
+      run: |
+        # Install test dependencies
+        pip install requests pytest
+        
+        # Run basic integration tests
+        python -c "
+        import requests
+        import time
+        
+        # Test backend health
+        response = requests.get('http://localhost:8000/health')
+        assert response.status_code == 200
+        print('✓ Backend health check passed')
+        
+        # Test frontend availability
+        response = requests.get('http://localhost:3000')
+        assert response.status_code == 200
+        print('✓ Frontend availability check passed')
+        
+        # Test API endpoints
+        response = requests.get('http://localhost:8000/api/v1/analysis/supported-languages')
+        assert response.status_code == 200
+        print('✓ API endpoint check passed')
+        
+        print('All integration tests passed!')
+        "
+    
+    - name: Stop services
+      run: docker-compose down -v
+
+  # Deploy to Staging
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [integration-test]
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+    
+    steps:
+    - name: Deploy to staging
+      run: |
+        echo "Deploying to staging environment..."
+        # Add your staging deployment commands here
+        # e.g., kubectl apply -f k8s/staging/
+        # or terraform apply -var="environment=staging"
+
+  # Deploy to Production
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Deploy to production
+      run: |
+        echo "Deploying to production environment..."
+        # Add your production deployment commands here
+        # e.g., kubectl apply -f k8s/production/
+        # or terraform apply -var="environment=production"
