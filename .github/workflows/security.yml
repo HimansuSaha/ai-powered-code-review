@@ -7,7 +7,7 @@ on:
     branches: [ main ]
   schedule:
     # Run daily security scan at 2 AM UTC
-    - cron: '0 2 * * *'
+    - cron: @never
 
 jobs:
   security-scan:
